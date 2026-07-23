@@ -1,0 +1,52 @@
+# Run configuration: sandbox, time, token and tool budgets.
+#
+# These values are a documented *reconstruction*. The Schema paper describes the
+# shape of the budget (planning/verification get more reasoning compute than
+# execution; the world model is a small Python program checked before acting)
+# but does not publish exact limits. Treat every number here as a tunable
+# starting point, not a claim about the original run. See
+# docs/SANDBOX_AND_BUDGETS.md.
+
+sandbox:
+  # The agent's world model is executed in an isolated subprocess with no
+  # network and a wall-clock + memory cap. The harness itself contains no
+  # game-specific code; only the agent-authored program runs here.
+  backend: subprocess        # subprocess | none (none = trusted, for tests)
+  network: false
+  wall_clock_s: 5            # per world-model / planner invocation
+  memory_mb: 512
+  cpu_seconds: 5
+  allowed_imports:           # import allowlist enforced by the sandbox loader
+    - dataclasses
+    - itertools
+    - collections
+    - heapq
+    - math
+    - typing
+
+budgets:
+  max_live_actions_per_level: 300   # hard stop to bound RHAE cost
+  max_model_edits_per_level: 40     # revisions of the world-model program
+  max_plan_depth: 64                # planner search horizon (steps)
+  max_plan_nodes: 200000            # planner search node cap
+  token_budget_per_level: 2000000   # summed model output tokens, soft cap
+  verify_min_transitions: 1         # transitions required before trusting a model
+
+tools:
+  # The small, fixed tool surface the agent may call. Deliberately minimal:
+  # everything game-specific lives in the agent's editable program, not in tools.
+  - name: edit_world_model
+    desc: Replace or patch the single editable world-model program.
+  - name: run_verifier
+    desc: Run the world-model + planner verifiers against recorded history.
+  - name: run_planner
+    desc: Search inside the current world model for an action sequence to the goal.
+  - name: submit_actions
+    desc: Commit a verified plan (or a single exploratory action) to the live game.
+  - name: observe
+    desc: Read the latest frame(s) and recorded transition history.
+
+env:
+  provider: replay           # replay (offline traces) | live (ARC-AGI-3 API)
+  games: []                  # empty = all discovered games
+  seed: 0                    # pins harness-side randomness (not the model's)

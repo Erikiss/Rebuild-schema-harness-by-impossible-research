@@ -1,0 +1,8 @@
+# Core (offline pipeline + tests)
+pyyaml>=6.0
+pytest>=8.0
+
+# Live evaluation extras — install as needed; the offline pipeline does not use them.
+# anthropic>=0.116   # Opus 4.8 + Fable 5 (server-side refusal fallback)
+# openai>=1.0        # GPT-5.6 Sol
+# arc-agi-3>=0.1     # live ARC-AGI-3 environment
