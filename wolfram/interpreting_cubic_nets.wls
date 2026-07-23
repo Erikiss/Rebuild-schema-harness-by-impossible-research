@@ -54,8 +54,11 @@ If[$InputFileName =!= "",
 ];
 
 (* ---- 4. Landmark points of a cubic --------------------------------------- *)
-roots[a_, b_] := Select[x /. Solve[cubic[x, a, b] == 0, x], Im[#] == 0 &] // Re;
-critical[a_, b_] := Select[x /. Solve[3 x^2 + 2 a x + 1 == 0, x], Im[#] == 0 &] // Re;
+(* Tolerant real-root filter: numerically solved cubics return real roots with a
+   tiny imaginary residue (~1e-16), so test Abs[Im] < tol rather than Im == 0. *)
+realParts[sol_] := Re @ Select[sol, Abs[Im[#]] < 10^-8 &];
+roots[a_, b_] := realParts[x /. Solve[cubic[x, a, b] == 0, x]];
+critical[a_, b_] := realParts[x /. Solve[3 x^2 + 2 a x + 1 == 0, x]];
 inflection[a_] := -a/3;   (* root of f''(x) = 6x + 2a *)
 
 (* ---- 5. Bucket test: recover the slope c of a diagonal-band feature ------- *)

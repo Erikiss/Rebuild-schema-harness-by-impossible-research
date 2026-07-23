@@ -20,11 +20,17 @@ import numpy as np
 
 
 def _topk(vals: np.ndarray, k: int) -> np.ndarray:
-    """Zero out all but the top-k entries (by value) in each row of a (n, d) array."""
+    """Zero out all but the top-k entries (by value) in each row of a (n, d) array.
+
+    Selects exactly k indices per row via argpartition (ties broken arbitrarily),
+    so the number of kept entries is never more than k even when values tie.
+    """
     if k >= vals.shape[1]:
         return vals
-    kth = np.partition(vals, -k, axis=1)[:, -k:].min(axis=1, keepdims=True)
-    return np.where(vals >= kth, vals, 0.0)
+    idx = np.argpartition(vals, -k, axis=1)[:, -k:]        # k largest indices per row
+    out = np.zeros_like(vals)
+    np.put_along_axis(out, idx, np.take_along_axis(vals, idx, axis=1), axis=1)
+    return out
 
 
 @dataclass

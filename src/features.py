@@ -29,8 +29,9 @@ from sae import TopKSAE
 def feature_grid(
     model: MLP, sae: TopKSAE, b_fixed: float, n: int = 80, lo: float = -3.0, hi: float = 3.0
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (grid, axis) where grid[f] is an (n, n) image of feature f over
-    rows a (top->bottom = hi->lo) and cols x (left->right = lo->hi)."""
+    """Return (grid, axis) where grid[f][i, j] is feature f's activation at
+    a = axis[i], x = axis[j] (axis runs lo->hi). Plotted with imshow
+    origin='lower', so x increases left->right and a increases bottom->top."""
     axis = np.linspace(lo, hi, n)
     xx, aa = np.meshgrid(axis, axis)               # xx varies along cols, aa along rows
     inp = np.stack([xx.ravel(), aa.ravel(), np.full(xx.size, b_fixed)], axis=1)
