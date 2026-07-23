@@ -26,5 +26,10 @@ schema-recompute-rhae = "scripts.recompute_rhae:main"
 [tool.setuptools]
 packages = ["schema_repro", "schema_repro.providers", "schema_repro.env", "schema_repro.scoring"]
 
+[tool.setuptools.package-data]
+# Ship the reconstructed role prompts so LLMAgent loads them from an installed
+# wheel, not just from a source checkout.
+schema_repro = ["prompts/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,9 @@
-"""Anthropic-backed provider (Opus 4.8 primary, Fable 5) — best-effort.
+"""Anthropic-backed provider (Fable 5 primary, Opus 4.8 refusal-fallback target).
 
-Schema reached ~99% RHAE with Opus 4.8 + Fable 5. This provider maps the
+Schema reached ~99% RHAE with Opus 4.8 + Fable 5. In this repo's default chain
+(``configs/models.yaml``) Fable 5 is the model that is called and Opus 4.8 is the
+model its safety refusals fall back to; this provider is one model per instance,
+and the registry wires the ordering. It maps the
 harness's abstract request onto the current Anthropic Messages API:
 
 * reasoning effort  -> ``output_config.effort`` (low|medium|high|xhigh|max);
@@ -24,8 +27,15 @@ import time
 from schema_repro.providers.base import ModelRequest, ModelResponse
 from schema_repro.types import Effort
 
-# Models whose thinking is always on and must NOT receive an explicit thinking param.
+# Model families whose thinking is always on and must NOT receive an explicit
+# thinking param. Matched by prefix so a dated snapshot (e.g. "claude-fable-5-...")
+# is still recognised — that is what makes the "keep the family prefix intact"
+# env-var override guidance in docs/MODEL_AND_FALLBACK.md correct.
 _ALWAYS_THINKING = ("claude-fable-5", "claude-mythos-5")
+
+
+def _is_always_thinking(model: str) -> bool:
+    return any(model.startswith(fam) for fam in _ALWAYS_THINKING)
 # The server-side refusal fallback target used for the Fable-5 -> Opus-4.8 hand-off.
 _DEFAULT_FALLBACK_MODEL = "claude-opus-4-8"
 _FALLBACK_BETA = "server-side-fallback-2026-06-01"
@@ -37,7 +47,7 @@ class AnthropicProvider:
     def __init__(self, model: str, *, enable_refusal_fallback: bool = True, max_tokens: int = 8192):
         self.model = model
         self.name = f"anthropic:{model}"
-        self.enable_refusal_fallback = enable_refusal_fallback and model in _ALWAYS_THINKING
+        self.enable_refusal_fallback = enable_refusal_fallback and _is_always_thinking(model)
         self.max_tokens = max_tokens
         self._client = None  # lazily constructed
 
@@ -59,7 +69,7 @@ class AnthropicProvider:
         }
         # Opus-tier: adaptive thinking must be requested explicitly. Fable 5:
         # thinking is always on, so the parameter is omitted.
-        if self.model not in _ALWAYS_THINKING:
+        if not _is_always_thinking(self.model):
             params["thinking"] = {"type": "adaptive"}
         if self.enable_refusal_fallback:
             params["betas"] = [_FALLBACK_BETA]
