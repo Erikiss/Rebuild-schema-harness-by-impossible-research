@@ -1,175 +1,160 @@
 # Interpreting How Neural Nets Regress Cubic Polynomials
 
-*A reproduction of the WSRI'26 project by Erik*
+*A reproduction of the WSRI'26 project by **Enrico Bottazzi***
 ([Wolfram Community](https://community.wolfram.com/groups/-/m/t/3763526) ·
 [LessWrong](https://www.lesswrong.com/posts/ysztF7doGvEbvTMqN/how-do-neural-networks-regress-cubic-polynomials))
 
-> **Provenance / honesty note.** This repository's execution environment blocks
-> outbound web fetches (the egress proxy returns `403` for `lesswrong.com`,
-> `community.wolfram.com`, and mirrors), so the original post could not be read
-> verbatim. This write-up reconstructs the article from its title, the excerpts
-> that surfaced through web search, and the standard theory of shallow ReLU
-> networks — and, crucially, it is backed by a **runnable reproduction** (see
-> `src/`) that empirically demonstrates every claim below. Where the original
-> chooses specific numbers (exact polynomial, hidden width, plots) our choices
-> are representative rather than guaranteed identical; the *mechanism* is the
-> invariant, and it is reproduced exactly. Correct any specifics and the code
-> will follow.
+> **What this is.** An independent, runnable reproduction of the essay's pipeline
+> and its central finding, built from the original notebook (PDF). Everything here
+> is trained and measured from scratch in pure NumPy — see `src/`. Because the
+> network and SAE are retrained with different tooling and random seeds, the
+> *indices* of the discovered features differ from the essay's, but the
+> phenomenon — a family of features that compute `t = x + c·a` with `c ≈ 1/3` —
+> reproduces cleanly.
 
 ---
 
 ## The question
 
-If you train a neural network to fit a smooth curve like the cubic
-`f(x) = x³ − 3x`, it works — but *how*? What is the network actually computing,
-and can we read that computation off the trained weights instead of treating the
-network as a black box?
+> *"Neural networks can easily learn to regress cubic polynomials of type
+> `y = x³ + a·x² + x + b`, but how do they do that?"*
 
-For a network whose activation is the **Ramp** function
-`Ramp(z) = max(0, z)` (a.k.a. ReLU), the answer is unusually clean and completely
-mechanistic.
+The essay's punchline: the network internally builds a variable **`t ≈ x + 0.3a`**,
+surprisingly close to the substitution **`t = x + a/3`** that the **Cardano method**
+uses as its first step for *solving* cubics. This reproduction rebuilds that result
+end to end.
 
-## The setup
+## Setup
 
-We regress a cubic with the smallest network that still tells the whole story: a
-single hidden layer of Ramp units.
+- **Target family**: `y = x³ + a·x² + x + b`, parametrised by `(a, b)`.
+- **Network**: an MLP that takes the triple `(x, a, b)` and outputs `y`, with four
+  hidden layers of width 15 (`15×15×15×15`, ReLU). Trained on `(x,a,b) ∈ [−3,3]³`.
+- Here it reaches **regression R² = 0.99994** on held-out inputs (`figures/01_nn_fit.png`).
 
-```
-NetChain[{
-    LinearLayer[H],          (* x  ->  w x + b   *)
-    ElementwiseLayer[Ramp],  (* Ramp[z] = Max[0, z] *)
-    LinearLayer[1]           (* h  ->  v . h + c *)
-}]
-```
+## Interpretability: neurons vs. sparse autoencoders
 
-- **Target:** `f(x) = x³ − 3x` on `x ∈ [−2, 2]` (the classic S-curve: local max at
-  `x = −1`, local min at `x = +1`, inflection at `x = 0`).
-- **Network:** `1 → H → 1` with `H = 24` Ramp units, trained with Adam on 400
-  evenly spaced samples.
+Reading individual neurons fails, because neurons are **polysemantic** — training
+pressure packs more concepts than there are neurons, so one neuron fires for
+unrelated things. The essay's tool is a **Sparse Autoencoder (SAE)**: an
+autoencoder that encodes the activation into a *larger* but *sparse* feature
+vector, disentangling the dense neurons into (hopefully) monosemantic features.
 
-## Key insight: a Ramp net *is* a piecewise-linear function
-
-The network computes, in closed form,
+We train a **64-feature SAE with TopK = 4** on the network's **last 15-dim
+activation layer**:
 
 ```
-y(x) = c + Σ_i  v_i · Ramp(w_i · x + b_i)
+z = TopK₄( ReLU(W_enc·(a − b_pre) + b_enc) )     # ≤ 4 active features per input
+â = z·W_dec + b_pre                                # reconstruction
 ```
 
-Each term `v_i · Ramp(w_i x + b_i)` is **zero on one side** of the point where its
-argument changes sign, and **linear on the other**. So the whole network is a
-*continuous piecewise-linear* (CPWL) function: straight-line segments joined at
-kinks. **Training a Ramp net to regress a curve is doing piecewise-linear
-regression** — the optimiser is choosing where to put the kinks and how sharp to
-make them.
+Here it reaches **reconstruction R² = 0.9923** (essay: 0.995), a close-to-lossless
+compression into sparse features.
 
-## The interpretation: breakpoints, delta-slopes, orientation
+## First hypothesis: do features track "landmark points"?
 
-Every hidden neuron `i` owns exactly one kink, and three numbers read straight off
-its weights describe it completely:
+A natural guess is that features fire near a polynomial's **roots**, **critical
+points** (roots of `f'`), or **inflection point** (root of `f''`, at `x = −a/3`).
+Measuring the correlation of each feature's activation profile against Gaussian
+bumps at those landmarks gives only weak, non-localised correlations — the same
+messy result the essay reports. The clean structure is elsewhere.
 
-| quantity | formula | meaning |
-|---|---|---|
-| **breakpoint** | `β_i = −b_i / w_i` | the `x` where neuron `i` switches on/off |
-| **delta-slope** | `μ_i = w_i · v_i` | the slope the neuron adds while it is active |
-| **orientation** | `s_i = sign(w_i)` | active to the **right** of `β_i` if `w_i > 0`, to the **left** if `w_i < 0` |
+## The "Aha!" moment: diagonal-band features
 
-The mechanism of a "kink": neuron `i` is switched off on one side of `β_i` (it
-contributes a flat 0) and switched on on the other (it contributes the line
-`μ_i·x + v_i·b_i`). As `x` increases across `β_i`, the network's total slope jumps
-by
+Instead of testing a hypothesis, fix `b` and just *plot* each feature's raw
+activation over the **`(x, a)` plane**. A group of features lights up in a
+**diagonal band** (`figures/02_feature_grid.png`): they do not care about `x` and
+`a` *separately*, only about a **linear combination `t = x + c·a`**, and they are
+**invariant to `b`** — the `b=0` and `b=1` maps are identical
+(`figures/03_b_invariance.png`).
 
-```
-Δslope_i = s_i · μ_i = |w_i| · v_i.
-```
+To pin down the slope `c` of a band, we run the essay's **bucket test** for each
+feature:
 
-> *"When a second-layer line hits a boundary, the linear function changes, so the
-> line kinks."*
+1. pick a candidate `c`; compute `t = x + c·a` for training inputs;
+2. chop them into 50 buckets by `t`; average the feature's activation per bucket;
+3. predict test activations from their bucket average; score with **R²**;
+4. sweep `c ∈ [−1, 1]` and keep the best.
 
-Sum these ramps and you get the staircase-derivative picture: the network's slope
-is **piecewise constant**, taking a step of size `|w_i|·v_i` at each breakpoint,
-and that staircase approximates the target's true slope `f'(x) = 3x² − 3`
-(`figures/03_slope.png`).
+In this run, **6 diagonal-band features** (R² ≥ 0.8, active, b-invariant) emerge:
 
-## This reading is exact, not an approximation
+| feature | best c | bucket R² | active frac | b-invariance |
+|--:|--:|--:|--:|--:|
+| #26 | +0.275 | 0.990 | 0.203 | 1.000 |
+| #16 | +0.300 | 0.973 | 0.260 | 0.999 |
+| #55 | +0.175 | 0.946 | 0.154 | 0.996 |
+| #50 | +0.325 | 0.933 | 0.109 | 0.990 |
+| #43 | +0.250 | 0.901 | 0.260 | 0.996 |
+| #34 | +0.575 | 0.865 | 0.289 | 0.990 |
 
-To prove the interpretation *is* the network rather than a story about it, we
-rebuild the piecewise-linear function segment by segment **from the extracted
-breakpoints and delta-slopes alone** (`interpret.reconstruct_pwl`) and compare it
-to the network's own forward pass:
+**Median `c = 0.287`** — right next to the Cardano value `a/3 = 0.333` and the
+essay's reported `≈ 0.3` (`figures/04_bucket_slopes.png`).
 
-```
-max |net(x) − analytic CPWL(x)|  ≈  3e-15
-```
+## Why `a/3` is special: the Cardano method
 
-That is machine epsilon: the breakpoint/delta-slope/orientation table is a
-lossless description of what the network computes.
+To solve `y = x³ + a·x² + x + b`, Cardano's first step substitutes `x → x − a/3`
+(equivalently `t = x + a/3`), which **removes the quadratic term** and yields a
+*depressed* cubic that is easier to solve. Geometrically it is a horizontal shift
+placing the **inflection point** (at `x = −a/3`) onto the axis, making the curve
+odd-symmetric (`figures/05_cardano.png`).
 
-## Where do the kinks go? Toward curvature
+So a network trained only to **regress** cubics has independently discovered the
+same coordinate a human uses to **solve** them. As the essay puts it: *the NN has
+discovered a new coordinate `t = x + a/3` and activates it to regress a cubic.*
 
-A straight line has zero error only where the target is straight. A
-piecewise-linear fit therefore has to spend its kinks where the target *bends* —
-i.e. where the second derivative `|f''(x)|` is large. For our cubic
-`f'' (x) = 6x`, curvature is **smallest at the inflection `x = 0`** and **largest at
-the domain edges `x = ±2`**.
+## How is the feature used? Manipulating the brain
 
-That is exactly what the trained network does. Weighting each breakpoint by how
-much slope it actually moves (`|Δslope_i|`), the kinks sit at a mean curvature
+We test the features by **intervention**: encode the last-layer activation, scale
+the diagonal-band features by a factor, decode, and finish the forward pass
+(`features.intervene`). Sweeping the factor `0.5 → 1.5` **vertically stretches** the
+regressed curve (`figures/06_intervention.png`), matching the essay's observation
+that these features act like a *multiplicative / vertical-stretch* effect rather
+than a literal horizontal shift — so the Cardano reading is suggestive but not
+fully confirmed by the intervention. (At factor `×1`, no manipulation, the curve
+matches the target up to the SAE's own reconstruction error.)
 
-```
-curvature enrichment = (curvature seen by kinks) / (average curvature) ≈ 1.27×
-```
-
-with a visible **gap around `x = 0`** and clustering toward the edges
-(`figures/04_curvature.png`). Breakpoints congregate where the cubic curves most —
-the network allocates its limited supply of kinks where they buy the most error
-reduction.
-
-## Results (this reproduction, seed 0)
+## Results summary (seed 0)
 
 | metric | value |
 |---|---|
-| Train MSE | `1.6 × 10⁻⁴` |
-| Max abs error on dense grid | `5.7 × 10⁻²` |
-| Interpretation exactness (`max|net − CPWL|`) | `3.2 × 10⁻¹⁵` |
-| Effective interior kinks | 20 / 24 |
-| Curvature enrichment at kinks | `1.27×` |
-
-Figures:
-
-- `figures/01_fit.png` — the piecewise-linear fit tracking the cubic, kinks marked.
-- `figures/02_ramps.png` — the individual neuron ramps that sum to the fit.
-- `figures/03_slope.png` — the piecewise-constant slope staircase vs. `f'(x)`.
-- `figures/04_curvature.png` — kinks congregating where `|f''|` is large.
-- `figures/05_training.png` — the training loss.
+| NN regression R² | `0.99994` |
+| SAE reconstruction R² | `0.9923` |
+| diagonal-band features found | 6 |
+| **median slope c** | **`0.287`** (Cardano `a/3 = 0.333`) |
+| feature b-invariance (grid corr.) | `0.99–1.00` |
 
 ## Reproduce it
 
 ```bash
-pip install numpy matplotlib
-python src/experiment.py          # trains, interprets, writes figures/ and results/
+pip install -r requirements.txt
+python src/experiment.py            # ~1 min: trains NN + SAE, runs analysis, writes figures/ + results/
+python tests/test_reproduction.py   # 5/5 checks (incl. bucket test recovering a known slope)
 ```
 
-The Wolfram Language version — matching the original project's tooling — is in
-`wolfram/interpreting_cubic_nets.wls`:
+The Wolfram Language version (matching the original tooling — NN in WL, SAE via an
+external Python library exactly as in the essay) is
+`wolfram/interpreting_cubic_nets.wls`.
 
-```bash
-wolframscript -file wolfram/interpreting_cubic_nets.wls
-```
+## Honest notes on fidelity
 
-## Takeaway
-
-A shallow Ramp/ReLU network regressing a cubic is not mysterious. It is doing
-**adaptive piecewise-linear regression**: each hidden neuron is one kink located at
-`−b/w`, contributing slope `w·v` on its active side. The trained weights are a
-direct, exact, human-readable description of the fitted curve, and the kinks end up
-concentrated where the target's curvature demands them.
+- **Feature indices differ** from the essay (`#7, #16, …`); with different random
+  seeds the SAE learns a different basis. The *statistic that matters* — median
+  `c ≈ 1/3` across b-invariant diagonal bands — is what reproduces.
+- The SAE here adds a standard pre-bias `b_pre` (the essay's bare
+  `z = ReLU(Wa+b); â = zD` reaches lower R²); this is the only deviation from the
+  stated SAE formula.
+- One recovered band (`#34`, `c ≈ 0.575`) sits away from the cluster — real
+  features are not perfectly clean; the *median* absorbs such outliers, as in the
+  essay.
+- We reproduce the essay's core arc (NN → SAE → diagonal bands → `t = x + a/3` →
+  intervention). The later sections (SAE on middle layers, the 7×7 grid of
+  single-polynomial nets, abstraction-emergence discussion) are described in the
+  essay but not reproduced here.
 
 ## References
 
-- [WSRI26] Interpreting How Neural Nets Regress Cubic Polynomials — Wolfram
-  Community: <https://community.wolfram.com/groups/-/m/t/3763526>
-- How Do Neural Networks Regress Cubic Polynomials — LessWrong:
+- Enrico Bottazzi, *[WSRI26] Interpreting How Neural Nets Regress Cubic
+  Polynomials* — Wolfram Community, Staff Picks (July 2026):
+  <https://community.wolfram.com/groups/-/m/t/3763526>
+- LessWrong mirror:
   <https://www.lesswrong.com/posts/ysztF7doGvEbvTMqN/how-do-neural-networks-regress-cubic-polynomials>
-- Background on shallow ReLU nets as splines and the breakpoint/delta-slope
-  (BDSO) parametrisation: *Shallow Univariate ReLU Networks as Splines*
-  (arXiv:2008.01772).
+- Cardano's method (depressed cubic via `x → x − a/3`), *Ars Magna* (1545).

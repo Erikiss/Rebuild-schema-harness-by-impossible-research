@@ -1,19 +1,24 @@
 # Reproduction results
 
-**Target**: `f(x) = 1*x^3 - 3*x` on x in [-2.0, 2.0]  
-**Network**: `1 -> 24 (Ramp) -> 1`, Adam, 30000 steps, lr=0.005, seed=0
+**Family**: `y = x^3 + a*x^2 + x + b` from input `(x, a, b)`, domain `[-3.0, 3.0]`.
 
-## Fit quality
-- Train MSE: `1.640e-04`
-- Max abs error on dense grid: `5.716e-02`
+## Model quality
+- NN regression R² (held-out): `0.99994`
+- SAE reconstruction R² (held-out, 64 features, TopK=4): `0.9923`
 
-## Interpretation is exact
-- Rebuilding the piecewise-linear function from the weights alone (breakpoints `-b_i/w_i`, delta-slopes `w_i v_i`) and comparing to the network's own forward pass gives a max difference of `3.16e-15` -- i.e. the mechanistic reading is the network, not an approximation of it.
-- 20 of 24 neurons place their kink inside the domain.
+## The central finding: features encode t = x + c·a ≈ the Cardano substitution
+- **6 diagonal-band features** are well explained by a single linear combination `t = x + c·a` and are invariant to `b`.
+- **Median slope c = 0.287**, vs the Cardano depression substitution `a/3 = 0.333`.
 
-## Kinks congregate in high-curvature regions
-- Slope-jump-weighted mean curvature seen by the breakpoints: `7.613`
-- Domain-average curvature: `6.003`
-- **Curvature enrichment: 1.27x** (>1 means kinks favour where the cubic bends most).
+| feature | best c | bucket-test R² | active frac | b-invariance |
+|--:|--:|--:|--:|--:|
+| #26 | +0.275 | 0.990 | 0.203 | 1.000 |
+| #16 | +0.300 | 0.973 | 0.260 | 0.999 |
+| #55 | +0.175 | 0.946 | 0.154 | 0.996 |
+| #50 | +0.325 | 0.933 | 0.109 | 0.990 |
+| #43 | +0.250 | 0.901 | 0.260 | 0.996 |
+| #34 | +0.575 | 0.865 | 0.289 | 0.990 |
 
-See `figures/` for the plots and `results/metrics.json` for the full per-neuron table.
+The NN, trained only to *regress* cubics, independently developed the same coordinate `t = x + a/3` that Cardano's method uses to *solve* them — the substitution that moves the inflection point (at `x = −a/3`) onto the axis and depresses the cubic (removes its quadratic term).
+
+See `figures/` for the feature grid, b-invariance, bucket-test slopes, the Cardano illustration and the intervention.

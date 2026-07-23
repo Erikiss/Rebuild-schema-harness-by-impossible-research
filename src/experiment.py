@@ -2,13 +2,13 @@
 
 Run:  python src/experiment.py
 
-Steps:
-  1. Build a cubic target and sample training data.
-  2. Train the 1->H->1 Ramp network to regress it.
-  3. Read the piecewise-linear function off the weights (breakpoints, delta-slopes).
-  4. Prove the reading is exact (analytic reconstruction == network forward pass).
-  5. Show the kinks congregate where the cubic curves most (|f''| large).
-  6. Save figures to figures/ and metrics/report to results/.
+Pipeline:
+  1. Train an MLP (3 -> 15x4 -> 1) to regress  y = x^3 + a x^2 + x + b  from (x,a,b).
+  2. Train a TopK Sparse Autoencoder (64 features, k=4) on its last activation layer.
+  3. Find the "diagonal band" features -- those explained by t = x + c*a, invariant to b.
+  4. Recover each band's slope c with the bucket test; the median is ~1/3 (Cardano).
+  5. Intervene on the band features and read off the effect on the regressed curve.
+Figures -> figures/, metrics + report -> results/.
 """
 
 from __future__ import annotations
@@ -25,12 +25,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from cubic_relu_net import Cubic, RampNet
-from interpret import (
-    extract_neurons,
-    reconstruct_pwl,
-    equivalence_error,
-    curvature_congregation,
+from cubic_model import MLP, sample_inputs, targets, cubic
+from sae import TopKSAE
+from features import (
+    feature_grid, best_slope, find_diagonal_features,
+    landmark_correlation, landmarks, intervene,
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,183 +38,226 @@ RES = os.path.join(ROOT, "results")
 os.makedirs(FIG, exist_ok=True)
 os.makedirs(RES, exist_ok=True)
 
-# --------------------------------------------------------------------------- #
-#  Config
-# --------------------------------------------------------------------------- #
 SEED = 0
-HIDDEN = 24
-DOMAIN = (-2.0, 2.0)
-N_TRAIN = 400
-STEPS = 30000
-LR = 5e-3
-CUBIC = Cubic(a3=1.0, a2=0.0, a1=-3.0, a0=0.0)  # f(x) = x^3 - 3x
+LO, HI = -3.0, 3.0
+NN_STEPS = 20000
+SAE_EPOCHS = 40
+N_ACTS = 120000
+CMAP = "jet"
 
 
 def main() -> None:
     rng = np.random.default_rng(SEED)
-    lo, hi = DOMAIN
 
-    # 1. Data ---------------------------------------------------------------- #
-    x_train = np.linspace(lo, hi, N_TRAIN)
-    y_train = CUBIC(x_train)
-    x_dense = np.linspace(lo, hi, 2001)
-    y_dense = CUBIC(x_dense)
+    # 1. Train the regression NN ------------------------------------------- #
+    print("Target family:  y = x^3 + a*x^2 + x + b   from input (x, a, b)")
+    print(f"Network:        3 -> 15 -> 15 -> 15 -> 15 -> 1 (ReLU), Adam {NN_STEPS} steps")
+    model = MLP(seed=SEED)
+    model.fit(rng, steps=NN_STEPS, batch=512, lr=2e-3, verbose=True)
+    nn_r2 = model.r2(np.random.default_rng(999))
+    print(f"NN regression R^2 (held-out) = {nn_r2:.5f}")
 
-    # 2. Train --------------------------------------------------------------- #
-    print(f"Target cubic:  f(x) = {CUBIC.as_str()}   on x in [{lo}, {hi}]")
-    print(f"Network:       1 -> {HIDDEN} (Ramp) -> 1   [Adam, {STEPS} steps]")
-    net = RampNet(hidden=HIDDEN, seed=SEED)
-    history = net.fit(x_train, y_train, steps=STEPS, lr=LR, verbose=True)
+    # 2. Train the SAE ----------------------------------------------------- #
+    acts_tr = model.layer_activations(sample_inputs(N_ACTS, rng))
+    acts_te = model.layer_activations(sample_inputs(20000, rng))
+    print(f"\nSAE:            {64} features, TopK=4, on the last 15-dim layer "
+          f"({N_ACTS} activations)")
+    sae = TopKSAE(n_features=64, k=4, seed=SEED)
+    sae.fit(acts_tr, epochs=SAE_EPOCHS, batch=2048, lr=1e-3, seed=SEED, verbose=True)
+    sae_r2 = sae.r2(acts_te)
+    print(f"SAE reconstruction R^2 (held-out) = {sae_r2:.4f}")
 
-    y_fit = net.forward(x_dense)
-    mse = float(np.mean((net.forward(x_train) - y_train) ** 2))
-    max_err = float(np.max(np.abs(y_fit - y_dense)))
-    print(f"Final train MSE = {mse:.3e},  max |error| on dense grid = {max_err:.3e}")
+    # 3-4. Diagonal band features and their slope c ------------------------ #
+    diag = find_diagonal_features(model, sae, np.random.default_rng(7),
+                                  r2_thresh=0.8, min_active=0.05)
+    cs = np.array([d["best_c"] for d in diag])
+    median_c = float(np.median(cs)) if len(cs) else float("nan")
+    print(f"\n{len(diag)} diagonal-band features (R^2>=0.8), invariant to b.")
+    print(f"MEDIAN slope c = {median_c:.3f}   vs Cardano a/3 = {1/3:.3f}")
 
-    # 3. Interpret ----------------------------------------------------------- #
-    neurons = extract_neurons(net)
-    pwl = reconstruct_pwl(net, DOMAIN)
+    # ---- Figures --------------------------------------------------------- #
+    _fig_nn_fit(model, FIG)
+    diag_feats = [d["feature"] for d in diag]
+    _fig_feature_grid(model, sae, diag_feats, FIG)
+    _fig_diagonal_invariance(model, sae, diag_feats[:6], FIG)
+    _fig_bucket_curves(model, sae, diag_feats, median_c, FIG)
+    _fig_cardano(FIG)
+    _fig_intervention(model, sae, diag_feats, FIG)
+    _fig_training_summary(nn_r2, sae_r2, FIG)
 
-    # 4. Exactness check ----------------------------------------------------- #
-    eq_err = equivalence_error(net, pwl, x_dense)
-    print(f"Interpretation exactness: max|net - analytic CPWL| = {eq_err:.2e} "
-          f"(should be ~1e-12)")
-
-    # 5. Curvature congregation --------------------------------------------- #
-    congr = curvature_congregation(net, CUBIC, DOMAIN)
-    print(f"Effective kinks inside domain: {congr['n_effective_breakpoints']}")
-    print(f"Curvature enrichment at kinks: {congr['curvature_enrichment']:.3f}x "
-          f"(>1 => kinks favour high-curvature regions)")
-
-    # ---- Figures ----------------------------------------------------------- #
-    interior_breaks = np.array(sorted(
-        n.breakpoint for n in neurons if lo < n.breakpoint < hi
-    ))
-
-    # Fig 1: the fit
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.plot(x_dense, y_dense, "k-", lw=2.4, label=f"target  f(x) = {CUBIC.as_str()}")
-    ax.plot(x_dense, y_fit, color="#d1495b", lw=1.6, label="Ramp-net fit (piecewise linear)")
-    ax.plot(x_train[::12], y_train[::12], "o", ms=3.5, color="#2e86ab",
-            alpha=0.6, label="training samples")
-    for xb in interior_breaks:
-        ax.axvline(xb, color="#888", lw=0.5, alpha=0.35)
-    ax.scatter(interior_breaks, net.forward(interior_breaks), s=22, color="#e0a800",
-               zorder=5, label="breakpoints  -b_i/w_i")
-    ax.set_xlabel("x"); ax.set_ylabel("y")
-    ax.set_title("A Ramp/ReLU net regresses the cubic as a piecewise-linear function")
-    ax.legend(loc="upper left", fontsize=9); ax.grid(alpha=0.2)
-    fig.tight_layout(); fig.savefig(os.path.join(FIG, "01_fit.png"), dpi=130); plt.close(fig)
-
-    # Fig 2: individual neuron ramps
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    for n in neurons:
-        contrib = n.v * np.maximum(0.0, n.w * x_dense + n.b)
-        ax.plot(x_dense, contrib, lw=1.0, alpha=0.7)
-    ax.axhline(0, color="k", lw=0.6)
-    ax.set_xlabel("x"); ax.set_ylabel("v_i * Ramp(w_i x + b_i)")
-    ax.set_title("Each hidden neuron contributes one ramp; their sum (+c) is the fit")
-    ax.grid(alpha=0.2)
-    fig.tight_layout(); fig.savefig(os.path.join(FIG, "02_ramps.png"), dpi=130); plt.close(fig)
-
-    # Fig 3: slope (derivative) is piecewise constant, jumping at each kink
-    dx = x_dense[1] - x_dense[0]
-    slope = np.gradient(y_fit, dx)
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.plot(x_dense, slope, color="#d1495b", lw=1.6, label="d/dx  net fit  (piecewise const.)")
-    ax.plot(x_dense, CUBIC.first_derivative(x_dense),
-            "k--", lw=1.4, label="f'(x) = 3x^2 - 3  (target slope)")
-    for xb in interior_breaks:
-        ax.axvline(xb, color="#888", lw=0.5, alpha=0.35)
-    ax.set_xlabel("x"); ax.set_ylabel("slope")
-    ax.set_title("Slope jumps by |w_i| v_i at each breakpoint -- that is the 'kink'")
-    ax.legend(loc="upper center", fontsize=9); ax.grid(alpha=0.2)
-    fig.tight_layout(); fig.savefig(os.path.join(FIG, "03_slope.png"), dpi=130); plt.close(fig)
-
-    # Fig 4: breakpoints congregate where |f''| is large
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True,
-                                   gridspec_kw={"height_ratios": [2, 1]})
-    curv = np.abs(CUBIC.second_derivative(x_dense))
-    ax1.plot(x_dense, curv, color="#2e86ab", lw=2.0, label="|f''(x)| = |6x|  (curvature)")
-    ax1.fill_between(x_dense, curv, alpha=0.12, color="#2e86ab")
-    jumps = np.array([abs(n.slope_jump) for n in neurons if lo < n.breakpoint < hi])
-    if len(interior_breaks):
-        ax1.vlines(interior_breaks, 0, np.interp(interior_breaks, x_dense, curv),
-                   color="#e0a800", lw=1.4, alpha=0.9)
-        ax1.scatter(interior_breaks, np.interp(interior_breaks, x_dense, curv),
-                    s=18 + 120 * jumps / (jumps.max() + 1e-9), color="#e0a800",
-                    zorder=5, label="breakpoints (size ~ |slope jump|)")
-    ax1.set_ylabel("curvature |f''|"); ax1.legend(fontsize=9); ax1.grid(alpha=0.2)
-    ax1.set_title(f"Kinks cluster where the cubic bends most "
-                  f"(enrichment {congr['curvature_enrichment']:.2f}x)")
-    # density histogram of breakpoints weighted by slope jump
-    if len(interior_breaks):
-        ax2.hist(interior_breaks, bins=16, range=DOMAIN, weights=jumps,
-                 color="#e0a800", alpha=0.8)
-    ax2.set_xlabel("x"); ax2.set_ylabel("sum |slope jump|"); ax2.grid(alpha=0.2)
-    fig.tight_layout(); fig.savefig(os.path.join(FIG, "04_curvature.png"), dpi=130); plt.close(fig)
-
-    # Fig 5: training curve
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.semilogy(history, color="#2e86ab", lw=1.2)
-    ax.set_xlabel("Adam step"); ax.set_ylabel("MSE"); ax.grid(alpha=0.2)
-    ax.set_title("Training loss")
-    fig.tight_layout(); fig.savefig(os.path.join(FIG, "05_training.png"), dpi=130); plt.close(fig)
-
-    # ---- Save metrics ------------------------------------------------------ #
+    # ---- Metrics + report ------------------------------------------------ #
     metrics = {
-        "config": {
-            "seed": SEED, "hidden": HIDDEN, "domain": list(DOMAIN),
-            "n_train": N_TRAIN, "steps": STEPS, "lr": LR,
-            "cubic": CUBIC.as_str(),
-        },
-        "fit": {"train_mse": mse, "max_abs_error_dense": max_err,
-                "final_loss": history[-1]},
-        "interpretation": {
-            "exactness_max_abs_diff": eq_err,
-            "n_neurons": HIDDEN,
-            "n_interior_breakpoints": int(len(interior_breaks)),
-            "breakpoints": interior_breaks.tolist(),
-            "neurons": [
-                {"index": n.index, "w": n.w, "b": n.b, "v": n.v,
-                 "breakpoint": n.breakpoint, "delta_slope": n.delta_slope,
-                 "orientation": n.orientation, "slope_jump": n.slope_jump}
-                for n in neurons
-            ],
-        },
-        "curvature_congregation": congr,
+        "config": {"seed": SEED, "domain": [LO, HI], "nn_steps": NN_STEPS,
+                   "sae_epochs": SAE_EPOCHS, "n_acts": N_ACTS,
+                   "family": "y = x^3 + a*x^2 + x + b"},
+        "nn_r2": nn_r2,
+        "sae_r2": sae_r2,
+        "cardano_a_over_3": 1 / 3,
+        "median_slope_c": median_c,
+        "n_diagonal_features": len(diag),
+        "diagonal_features": diag,
     }
     with open(os.path.join(RES, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-
     _write_report(metrics)
     print(f"\nSaved figures -> {FIG}\nSaved metrics/report -> {RES}")
 
 
-def _write_report(m: dict) -> None:
-    c = m["config"]; fit = m["fit"]; it = m["interpretation"]; cg = m["curvature_congregation"]
+# --------------------------------------------------------------------------- #
+#  Figures
+# --------------------------------------------------------------------------- #
+def _fig_nn_fit(model, out):
+    x = np.linspace(LO, HI, 200)
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.6))
+    for ax, (a, b) in zip(axes, [(3.0, -1.0), (-2.0, 2.0), (0.0, 0.0)]):
+        yt = cubic(x, a, b)
+        inp = np.stack([x, np.full_like(x, a), np.full_like(x, b)], axis=1)
+        yp = model.predict(inp)
+        ax.plot(x, yt, "k-", lw=2, label="target")
+        ax.plot(x, yp, "--", color="#d1495b", lw=1.6, label="NN")
+        ax.set_title(f"a={a:g}, b={b:g}"); ax.grid(alpha=0.2)
+        ax.set_xlabel("x")
+    axes[0].legend(fontsize=8); axes[0].set_ylabel("y")
+    fig.suptitle("The MLP regresses the cubic family  y = x^3 + a x^2 + x + b")
+    fig.tight_layout(); fig.savefig(os.path.join(out, "01_nn_fit.png"), dpi=130); plt.close(fig)
+
+
+def _fig_feature_grid(model, sae, diag_feats, out):
+    grid, axis = feature_grid(model, sae, 0.0, n=80)
+    vmax = np.percentile(grid, 99.5)
+    fig, axes = plt.subplots(8, 8, figsize=(13, 13))
+    for f, ax in enumerate(axes.ravel()):
+        ax.imshow(grid[f], origin="lower", extent=[LO, HI, LO, HI],
+                  cmap=CMAP, vmin=0, vmax=max(vmax, 1e-6), aspect="auto")
+        col = "#d1495b" if f in diag_feats else "#333"
+        ax.set_title(f"#{f}", fontsize=7, color=col,
+                     fontweight="bold" if f in diag_feats else "normal")
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("SAE feature activations over the (x, a) plane at b = 0  "
+                 "(red = diagonal-band features)", y=0.995)
+    fig.tight_layout(); fig.savefig(os.path.join(out, "02_feature_grid.png"), dpi=115); plt.close(fig)
+
+
+def _fig_diagonal_invariance(model, sae, feats, out):
+    if not feats:
+        return
+    g0, _ = feature_grid(model, sae, 0.0, n=80)
+    g1, _ = feature_grid(model, sae, 1.0, n=80)
+    ncol = len(feats)
+    fig, axes = plt.subplots(2, ncol, figsize=(2.2 * ncol, 4.8))
+    axes = np.atleast_2d(axes)
+    for j, f in enumerate(feats):
+        vmax = max(np.percentile(g0[f], 99.5), 1e-6)
+        for i, g in enumerate([g0, g1]):
+            ax = axes[i, j]
+            ax.imshow(g[f], origin="lower", extent=[LO, HI, LO, HI],
+                      cmap=CMAP, vmin=0, vmax=vmax, aspect="auto")
+            ax.set_xticks([]); ax.set_yticks([])
+            if i == 0:
+                ax.set_title(f"#{f}", fontsize=9)
+            if j == 0:
+                ax.set_ylabel(f"b = {i}", fontsize=10)
+    fig.suptitle("Diagonal-band features are invariant to b (top: b=0, bottom: b=1); "
+                 "the band lies along x + c·a = const")
+    fig.tight_layout(); fig.savefig(os.path.join(out, "03_b_invariance.png"), dpi=130); plt.close(fig)
+
+
+def _fig_bucket_curves(model, sae, feats, median_c, out):
+    if not feats:
+        return
+    rng = np.random.default_rng(11)
+    c_grid = np.round(np.arange(-1.0, 1.0001, 0.025), 4)
+    tr = rng.uniform(LO, HI, size=(20000, 3)); te = rng.uniform(LO, HI, size=(10000, 3))
+    from features import _bucket_r2, _feature_acts
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for f in feats:
+        a_tr = _feature_acts(model, sae, tr, f); a_te = _feature_acts(model, sae, te, f)
+        curve = [_bucket_r2(tr[:, 0] + c * tr[:, 1], a_tr,
+                            te[:, 0] + c * te[:, 1], a_te) for c in c_grid]
+        cbest = c_grid[int(np.argmax(curve))]
+        ax.plot(c_grid, curve, lw=1.4, alpha=0.85, label=f"#{f} (c*={cbest:+.3f})")
+    ax.axvline(1 / 3, color="k", ls="--", lw=1.4, label="Cardano  a/3 = 0.333")
+    ax.axvline(median_c, color="#e0a800", ls="-", lw=1.6, label=f"median c* = {median_c:.3f}")
+    ax.set_xlabel("candidate slope c  in  t = x + c·a"); ax.set_ylabel("bucket-test R²")
+    ax.set_title("Each diagonal-band feature is best explained by t = x + c·a with c ≈ 1/3")
+    ax.legend(fontsize=8, ncol=2); ax.grid(alpha=0.2); ax.set_ylim(top=1.02)
+    fig.tight_layout(); fig.savefig(os.path.join(out, "04_bucket_slopes.png"), dpi=130); plt.close(fig)
+
+
+def _fig_cardano(out):
+    x = np.linspace(-3, 3, 400)
+    a, b = 3.0, -1.0
+    y = cubic(x, a, b)
+    infl = -a / 3.0
+    # depressed cubic: substitute x = t - a/3  ->  removes the quadratic term
+    t = x
+    y_dep = (t) ** 3 + (1 - a**2 / 3.0) * t + (b + 2 * a**3 / 27.0 - a / 3.0)
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    ax.plot(x, y, "k-", lw=2, label=f"y = x³ + {a:g}x² + x + {b:g}")
+    ax.axvline(infl, color="#2e86ab", ls=":", lw=1.4, label=f"inflection at x = −a/3 = {infl:.2f}")
+    ax.plot(x, y_dep, color="#d1495b", lw=2, label="depressed: t = x + a/3 (no quadratic term)")
+    ax.axvline(0, color="#888", lw=0.6); ax.axhline(0, color="#888", lw=0.6)
+    ax.set_xlabel("x  /  t"); ax.set_ylabel("y"); ax.grid(alpha=0.2)
+    ax.set_title("Cardano's first step: t = x + a/3 shifts the inflection point onto the y-axis")
+    ax.legend(fontsize=9); ax.set_ylim(-20, 20)
+    fig.tight_layout(); fig.savefig(os.path.join(out, "05_cardano.png"), dpi=130); plt.close(fig)
+
+
+def _fig_intervention(model, sae, feats, out):
+    if not feats:
+        return
+    x = np.linspace(LO, HI, 200)
+    a, b = 3.0, 2.0
+    yt = cubic(x, a, b)
+    inp = np.stack([x, np.full_like(x, a), np.full_like(x, b)], axis=1)
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    ax.plot(x, yt, "k-", lw=2.2, label="target")
+    for factor in [0.5, 0.75, 1.0, 1.25, 1.5]:
+        yp = intervene(model, sae, inp, feats, factor)
+        ax.plot(x, yp, lw=1.4, alpha=0.85, label=f"clamp ×{factor:g}")
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.grid(alpha=0.2)
+    ax.set_title(f"Clamping the {len(feats)} diagonal-band features (a={a:g}, b={b:g}) "
+                 f"vertically stretches the regressed curve")
+    ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(os.path.join(out, "06_intervention.png"), dpi=130); plt.close(fig)
+
+
+def _fig_training_summary(nn_r2, sae_r2, out):
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    ax.axis("off")
+    txt = (f"NN regression R²  =  {nn_r2:.5f}\n"
+           f"SAE reconstruction R²  =  {sae_r2:.4f}")
+    ax.text(0.5, 0.5, txt, ha="center", va="center", fontsize=14, family="monospace")
+    fig.tight_layout(); fig.savefig(os.path.join(out, "07_quality.png"), dpi=130); plt.close(fig)
+
+
+def _write_report(m):
+    d = m["diagonal_features"]
     lines = [
         "# Reproduction results\n",
-        f"**Target**: `f(x) = {c['cubic']}` on x in [{c['domain'][0]}, {c['domain'][1]}]  ",
-        f"**Network**: `1 -> {c['hidden']} (Ramp) -> 1`, Adam, {c['steps']} steps, lr={c['lr']}, seed={c['seed']}\n",
-        "## Fit quality",
-        f"- Train MSE: `{fit['train_mse']:.3e}`",
-        f"- Max abs error on dense grid: `{fit['max_abs_error_dense']:.3e}`\n",
-        "## Interpretation is exact",
-        f"- Rebuilding the piecewise-linear function from the weights alone "
-        f"(breakpoints `-b_i/w_i`, delta-slopes `w_i v_i`) and comparing to the "
-        f"network's own forward pass gives a max difference of "
-        f"`{it['exactness_max_abs_diff']:.2e}` -- i.e. the mechanistic reading is "
-        f"the network, not an approximation of it.",
-        f"- {it['n_interior_breakpoints']} of {it['n_neurons']} neurons place their "
-        f"kink inside the domain.\n",
-        "## Kinks congregate in high-curvature regions",
-        f"- Slope-jump-weighted mean curvature seen by the breakpoints: "
-        f"`{cg['weighted_curvature_at_breakpoints']:.3f}`",
-        f"- Domain-average curvature: `{cg['mean_domain_curvature']:.3f}`",
-        f"- **Curvature enrichment: {cg['curvature_enrichment']:.2f}x** "
-        f"(>1 means kinks favour where the cubic bends most).\n",
-        "See `figures/` for the plots and `results/metrics.json` for the full per-neuron table.",
+        f"**Family**: `{m['config']['family']}` from input `(x, a, b)`, "
+        f"domain `[{m['config']['domain'][0]}, {m['config']['domain'][1]}]`.\n",
+        "## Model quality",
+        f"- NN regression R² (held-out): `{m['nn_r2']:.5f}`",
+        f"- SAE reconstruction R² (held-out, 64 features, TopK=4): `{m['sae_r2']:.4f}`\n",
+        "## The central finding: features encode t = x + c·a ≈ the Cardano substitution",
+        f"- **{m['n_diagonal_features']} diagonal-band features** are well explained by a "
+        f"single linear combination `t = x + c·a` and are invariant to `b`.",
+        f"- **Median slope c = {m['median_slope_c']:.3f}**, vs the Cardano depression "
+        f"substitution `a/3 = {m['cardano_a_over_3']:.3f}`.\n",
+        "| feature | best c | bucket-test R² | active frac | b-invariance |",
+        "|--:|--:|--:|--:|--:|",
+    ]
+    for r in d:
+        lines.append(f"| #{r['feature']} | {r['best_c']:+.3f} | {r['r2']:.3f} | "
+                     f"{r['active_frac']:.3f} | {r['b_invariance']:.3f} |")
+    lines += [
+        "\nThe NN, trained only to *regress* cubics, independently developed the same "
+        "coordinate `t = x + a/3` that Cardano's method uses to *solve* them — the "
+        "substitution that moves the inflection point (at `x = −a/3`) onto the axis and "
+        "depresses the cubic (removes its quadratic term).",
+        "\nSee `figures/` for the feature grid, b-invariance, bucket-test slopes, the "
+        "Cardano illustration and the intervention.",
     ]
     with open(os.path.join(RES, "report.md"), "w") as f:
         f.write("\n".join(lines) + "\n")

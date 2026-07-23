@@ -1,6 +1,6 @@
-"""Self-contained checks that the mechanistic interpretation really is exact.
+"""Self-contained checks for the SAE / Cardano reproduction.
 
-Runnable with plain Python (no pytest needed):
+Runnable with plain Python (no pytest):
 
     python tests/test_reproduction.py
 
@@ -16,87 +16,81 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from cubic_relu_net import Cubic, RampNet
-from interpret import extract_neurons, reconstruct_pwl, equivalence_error
+from cubic_model import MLP, cubic, sample_inputs, targets
+from sae import TopKSAE, _topk
+from features import landmarks, _bucket_r2
 
 
-def _train_small() -> tuple[RampNet, Cubic, tuple[float, float]]:
-    cubic = Cubic(a3=1.0, a2=0.0, a1=-3.0, a0=0.0)
-    domain = (-2.0, 2.0)
-    x = np.linspace(*domain, 300)
-    net = RampNet(hidden=16, seed=0)
-    net.fit(x, cubic(x), steps=4000, lr=5e-3)
-    return net, cubic, domain
+def test_cubic_and_landmarks() -> None:
+    """Polynomial evaluation and landmark formulas (inflection at -a/3)."""
+    x = np.array([0.0, 1.0, -1.0])
+    assert np.allclose(cubic(x, 2.0, -1.0), x**3 + 2 * x**2 + x - 1)
+    lm = landmarks(2.0, -1.0)
+    assert abs(lm["inflection"] - (-2.0 / 3.0)) < 1e-12
+    # roots really are roots
+    for r in lm["roots"]:
+        assert abs(r**3 + 2 * r**2 + r - 1) < 1e-8
+    print("[ok] cubic eval + landmark formulas")
 
 
-def test_forward_matches_closed_form() -> None:
-    """net.forward must equal c + Σ v_i·Ramp(w_i x + b_i) exactly."""
-    net, _, domain = _train_small()
-    x = np.linspace(*domain, 501)
-    closed = net.c + np.maximum(0.0, np.outer(x, net.w) + net.b) @ net.v
-    err = float(np.max(np.abs(net.forward(x) - closed)))
-    assert err < 1e-12, f"forward != closed form (err={err:.2e})"
-    print(f"[ok] forward == closed form                (max diff {err:.1e})")
+def test_topk_sparsity() -> None:
+    """TopK keeps at most k nonzero entries per row."""
+    rng = np.random.default_rng(0)
+    v = np.abs(rng.normal(size=(50, 64)))
+    z = _topk(v, 4)
+    assert np.all((z > 0).sum(axis=1) <= 4)
+    print("[ok] TopK keeps <= k active features")
 
 
-def test_interpretation_is_exact() -> None:
-    """The analytic piecewise-linear rebuild from weights must match the net."""
-    net, _, domain = _train_small()
-    x = np.linspace(*domain, 4000)
-    pwl = reconstruct_pwl(net, domain)
-    err = equivalence_error(net, pwl, x)
-    assert err < 1e-10, f"CPWL reconstruction not exact (err={err:.2e})"
-    print(f"[ok] analytic CPWL == network             (max diff {err:.1e})")
+def test_nn_learns_family() -> None:
+    """The MLP regresses the whole (x,a,b) cubic family to high R^2 (small config)."""
+    rng = np.random.default_rng(0)
+    m = MLP(seed=0)
+    m.fit(rng, steps=6000, batch=512, lr=2e-3)
+    r2 = m.r2(np.random.default_rng(1), n=20000)
+    assert r2 > 0.99, f"NN R^2 too low ({r2:.4f})"
+    print(f"[ok] NN regresses the cubic family        (R^2 {r2:.4f})")
 
 
-def test_breakpoint_formula() -> None:
-    """Each neuron's preactivation is exactly zero at its breakpoint -b/w."""
-    net, _, _ = _train_small()
-    for n in extract_neurons(net):
-        z = n.w * n.breakpoint + n.b
-        assert abs(z) < 1e-9, f"neuron {n.index}: w·β+b = {z:.2e} (expected 0)"
-    print("[ok] preactivation vanishes at -b/w        (all neurons)")
+def test_sae_reconstructs() -> None:
+    """The TopK SAE reconstructs last-layer activations with high R^2."""
+    rng = np.random.default_rng(0)
+    m = MLP(seed=0); m.fit(rng, steps=6000, batch=512, lr=2e-3)
+    tr = m.layer_activations(sample_inputs(40000, rng))
+    te = m.layer_activations(sample_inputs(8000, rng))
+    sae = TopKSAE(n_features=64, k=4, seed=0)
+    sae.fit(tr, epochs=20, batch=2048, lr=1e-3, seed=0)
+    r2 = sae.r2(te)
+    assert r2 > 0.95, f"SAE R^2 too low ({r2:.4f})"
+    z = sae.encode(te[:100])
+    assert np.all((z > 0).sum(axis=1) <= 4)
+    print(f"[ok] SAE reconstructs the last layer      (R^2 {r2:.4f})")
 
 
-def test_slope_jump_identity() -> None:
-    """Slope jump across a kink equals |w_i|·v_i (delta-slope × orientation)."""
-    net, _, _ = _train_small()
-    for n in extract_neurons(net):
-        assert np.isclose(n.slope_jump, abs(n.w) * n.v, atol=1e-12)
-    print("[ok] slope jump == |w|·v                   (all neurons)")
-
-
-def test_constant_neuron_included() -> None:
-    """A degenerate w_i == 0 (constant) neuron must still be reconstructed exactly."""
-    net = RampNet(hidden=2, seed=0)
-    net.w = np.array([0.0, 1.0])   # neuron 0 is a pure constant v0*max(0,b0)
-    net.b = np.array([3.0, 0.0])
-    net.v = np.array([2.0, 1.0])
-    net.c = 0.0
-    pwl = reconstruct_pwl(net, (-2.0, 2.0))
-    x = np.linspace(-5, 5, 500)
-    err = float(np.max(np.abs(net.forward(x) - pwl(x))))
-    assert err < 1e-12, f"constant neuron dropped from reconstruction (err={err:.2e})"
-    print(f"[ok] w==0 constant neuron reconstructed    (max diff {err:.1e})")
-
-
-def test_fit_is_reasonable() -> None:
-    """Sanity: the small net actually learns the cubic."""
-    net, cubic, domain = _train_small()
-    x = np.linspace(*domain, 400)
-    mse = float(np.mean((net.forward(x) - cubic(x)) ** 2))
-    assert mse < 1e-2, f"fit too poor (mse={mse:.2e})"
-    print(f"[ok] network learns the cubic             (mse {mse:.1e})")
+def test_bucket_recovers_slope() -> None:
+    """The bucket test recovers the true slope c0 of a synthetic t = x + c0*a feature."""
+    rng = np.random.default_rng(0)
+    c0 = 0.3
+    tr = rng.uniform(-3, 3, size=(20000, 2))
+    te = rng.uniform(-3, 3, size=(10000, 2))
+    # activation is a nonlinear function of t = x + c0*a, plus a little noise
+    f = lambda t: np.maximum(0.0, t - 1.0) ** 2
+    a_tr = f(tr[:, 0] + c0 * tr[:, 1]) + 0.01 * rng.normal(size=len(tr))
+    a_te = f(te[:, 0] + c0 * te[:, 1]) + 0.01 * rng.normal(size=len(te))
+    c_grid = np.round(np.arange(-1, 1.0001, 0.025), 4)
+    r2s = [_bucket_r2(tr[:, 0] + c * tr[:, 1], a_tr, te[:, 0] + c * te[:, 1], a_te) for c in c_grid]
+    best_c = c_grid[int(np.argmax(r2s))]
+    assert abs(best_c - c0) <= 0.05, f"recovered c={best_c} not near {c0}"
+    print(f"[ok] bucket test recovers the true slope  (c={best_c:+.3f}, truth {c0:+.3f})")
 
 
 if __name__ == "__main__":
     tests = [
-        test_forward_matches_closed_form,
-        test_interpretation_is_exact,
-        test_breakpoint_formula,
-        test_slope_jump_identity,
-        test_constant_neuron_included,
-        test_fit_is_reasonable,
+        test_cubic_and_landmarks,
+        test_topk_sparsity,
+        test_bucket_recovers_slope,
+        test_nn_learns_family,
+        test_sae_reconstructs,
     ]
     failed = 0
     for t in tests:
