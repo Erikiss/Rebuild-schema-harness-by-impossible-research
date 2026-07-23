@@ -1,0 +1,47 @@
+# Model + fallback configuration for the reproduction harness.
+#
+# Schema reached ~99% RHAE with Opus 4.8 + Fable 5 and 95.35% with GPT-5.6 Sol.
+# Model IDs are intentionally NOT hard-coded to specific dated snapshots: the
+# exact API versions used by Impossible Research are not public and drift over
+# time (see docs/MODEL_AND_FALLBACK.md). Override the ids via env vars.
+#
+# Per-phase reasoning effort follows the public guidance: planning and
+# verification warrant extra-high compute; execution warrants high.
+
+profiles:
+  anthropic:
+    # Fallback chain, primary first. The Fable-5 <-> Opus-4.8 hand-off is a
+    # provider-internal safety behaviour we can only approximate as a chain.
+    chain:
+      - provider: anthropic
+        model_env: ANTHROPIC_DEFAULT_FABLE_MODEL
+        model_default: claude-fable-5
+      - provider: anthropic
+        model_env: ANTHROPIC_DEFAULT_OPUS_MODEL
+        model_default: claude-opus-4-8
+    fallback_on: [refusal, error, timeout]
+
+  openai:
+    chain:
+      - provider: openai
+        model_env: OPENAI_DEFAULT_MODEL
+        model_default: gpt-5.6-sol
+    fallback_on: [error, timeout]
+
+  # Fully offline profile for tests / trace replay — no network, deterministic.
+  fake:
+    chain:
+      - provider: fake
+        model_default: fake-echo
+    fallback_on: [error]
+
+# Reasoning effort assigned to each controller phase.
+effort_by_phase:
+  ground: high
+  discover: xhigh
+  verify: xhigh
+  refactor: high
+  plan: xhigh
+  execute: high
+
+default_profile: anthropic

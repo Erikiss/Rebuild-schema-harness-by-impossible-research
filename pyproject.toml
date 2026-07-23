@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schema-repro"
+version = "0.1.0"
+description = "Clean-room reproduction of the conceptual agentic structure of the Schema harness (Impossible Research) for ARC-AGI-3."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Live evaluation extras — not needed for the offline pipeline or the tests.
+anthropic = ["anthropic>=0.116"]
+openai = ["openai>=1.0"]
+arc = ["arc-agi-3>=0.1"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+schema-recompute-rhae = "scripts.recompute_rhae:main"
+
+[tool.setuptools]
+packages = ["schema_repro", "schema_repro.providers", "schema_repro.env", "schema_repro.scoring"]
+
+[tool.setuptools.package-data]
+# Ship the reconstructed role prompts so LLMAgent loads them from an installed
+# wheel, not just from a source checkout.
+schema_repro = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
